@@ -1,8 +1,11 @@
 import os
 import json
 import html
+import asyncio
 import logging
 from datetime import datetime
+
+import redis
 
 from telegram import (
     Update,
@@ -11,6 +14,8 @@ from telegram import (
 )
 
 from telegram.constants import ParseMode
+
+from telegram.error import RetryAfter
 
 from telegram.ext import (
     ApplicationBuilder,
@@ -28,13 +33,28 @@ from telegram.ext import (
 
 TOKEN = "8219656117:AAGhTeVBUkqlEDw6IwMr0F1QoGqUwupESI4"
 
-DESTINATION_CHAT_ID = -1003889779689
+DESTINATION_CHAT_ID = -1001234567890
 
-ADMINS = [7583614563]
+ADMINS = [123456789]
 
 AUTO_DELETE = False
 
 CHATS_FILE = "chats.json"
+
+REDIS_HOST = "localhost"
+
+REDIS_PORT = 6379
+
+# =========================================================
+# REDIS
+# =========================================================
+
+REDIS = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=0,
+    decode_responses=True
+)
 
 # =========================================================
 # LOGGING
@@ -64,6 +84,7 @@ stats = {
 # =========================================================
 
 def reset_daily():
+
     today = datetime.now().date()
 
     if stats["date"] != today:
@@ -72,26 +93,33 @@ def reset_daily():
 
 
 def load_chats():
+
     global added_chats
 
     try:
+
         if os.path.exists(CHATS_FILE):
+
             with open(CHATS_FILE, "r") as f:
                 added_chats = json.load(f)
 
     except Exception as e:
+
         logger.error(f"Load chats error: {e}")
+
         added_chats = {}
 
 
 def save_chats():
+
     try:
+
         with open(CHATS_FILE, "w") as f:
             json.dump(added_chats, f)
 
     except Exception as e:
-        logger.error(f"Save chats error: {e}")
 
+        logger.error(f"Save chats error: {e}")
 
 # =========================================================
 # CLEAN CAPTION
@@ -135,9 +163,8 @@ def clean_caption(text):
 
     return result[:900]
 
-
 # =========================================================
-# TEMPLATE
+# CAPTION
 # =========================================================
 
 def build_caption(original_caption, source_name):
@@ -155,12 +182,129 @@ def build_caption(original_caption, source_name):
 
     return caption[:1024]
 
+# =========================================================
+# SAFE COPY
+# =========================================================
+
+async def safe_copy(
+    context,
+    chat_id,
+    from_chat_id,
+    message_id,
+    caption=None
+):
+
+    retries = 5
+
+    for attempt in range(retries):
+
+        try:
+
+            await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            )
+
+            return True
+
+        except RetryAfter as e:
+
+            logger.warning(
+                f"FloodWait: sleeping {e.retry_after}"
+            )
+
+            await asyncio.sleep(e.retry_after)
+
+        except Exception as e:
+
+            logger.error(
+                f"Copy failed attempt {attempt+1}: {e}"
+            )
+
+            await asyncio.sleep(2)
+
+    return False
 
 # =========================================================
-# ADMIN COMMANDS
+# MEDIA GROUP PROCESSOR
 # =========================================================
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_media_group(
+    group_id,
+    context
+):
+
+    await asyncio.sleep(3)
+
+    key = f"media_group:{group_id}"
+
+    raw_messages = REDIS.lrange(key, 0, -1)
+
+    if not raw_messages:
+        return
+
+    messages = [
+        json.loads(x)
+        for x in raw_messages
+    ]
+
+    messages.sort(
+        key=lambda x: x["message_id"]
+    )
+
+    first = messages[0]
+
+    original_caption = clean_caption(
+        first.get("caption", "")
+    )
+
+    source_name = html.escape(
+        first.get("chat_title", "Private")
+    )
+
+    new_caption = build_caption(
+        original_caption,
+        source_name
+    )
+
+    success_count = 0
+
+    for idx, msg in enumerate(messages):
+
+        caption = new_caption if idx == 0 else None
+
+        ok = await safe_copy(
+            context=context,
+            chat_id=DESTINATION_CHAT_ID,
+            from_chat_id=msg["chat_id"],
+            message_id=msg["message_id"],
+            caption=caption
+        )
+
+        if ok:
+            success_count += 1
+
+        await asyncio.sleep(0.4)
+
+    logger.info(
+        f"✅ Media Group Done "
+        f"{group_id} "
+        f"{success_count}/{len(messages)}"
+    )
+
+    REDIS.delete(key)
+
+# =========================================================
+# ADMIN COMMAND
+# =========================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_user.id not in ADMINS:
         return
@@ -171,12 +315,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"""
 📊 <b>Bot Statistics</b>
 
-📅 Today Forwarded: {stats['today']}
-🚀 Total Forwarded: {stats['total']}
+📅 Today: {stats['today']}
+🚀 Total: {stats['total']}
         """,
         parse_mode=ParseMode.HTML
     )
-
 
 # =========================================================
 # JOIN REQUEST
@@ -190,17 +333,18 @@ async def approve_join(
     request: ChatJoinRequest = update.chat_join_request
 
     try:
+
         await context.bot.approve_chat_join_request(
             chat_id=request.chat.id,
             user_id=request.from_user.id
         )
 
     except Exception as e:
+
         logger.error(f"Approve error: {e}")
 
-
 # =========================================================
-# TRACK GROUPS
+# TRACK CHATS
 # =========================================================
 
 async def track_chats(
@@ -214,6 +358,7 @@ async def track_chats(
         return
 
     chat = result.chat
+
     status = result.new_chat_member.status
 
     try:
@@ -235,6 +380,7 @@ async def track_chats(
         ]:
 
             if str(chat.id) in added_chats:
+
                 del added_chats[str(chat.id)]
 
                 save_chats()
@@ -242,10 +388,11 @@ async def track_chats(
                 logger.info(f"Removed: {chat.title}")
 
     except Exception as e:
+
         logger.error(f"Track error: {e}")
 
 # =========================================================
-# FORWARD ENGINE
+# MAIN FORWARD ENGINE
 # =========================================================
 
 async def auto_forward(
@@ -263,7 +410,7 @@ async def auto_forward(
     try:
 
         # =================================================
-        # MEDIA ONLY
+        # MEDIA FILTER
         # =================================================
 
         if not (
@@ -276,7 +423,42 @@ async def auto_forward(
             return
 
         # =================================================
-        # CLEAN CAPTION
+        # MEDIA GROUP
+        # =================================================
+
+        if message.media_group_id:
+
+            group_id = message.media_group_id
+
+            key = f"media_group:{group_id}"
+
+            data = {
+                "chat_id": message.chat_id,
+                "message_id": message.message_id,
+                "caption": message.caption,
+                "chat_title": message.chat.title
+            }
+
+            REDIS.rpush(
+                key,
+                json.dumps(data)
+            )
+
+            REDIS.expire(key, 120)
+
+            if REDIS.llen(key) == 1:
+
+                asyncio.create_task(
+                    process_media_group(
+                        group_id,
+                        context
+                    )
+                )
+
+            return
+
+        # =================================================
+        # SINGLE MESSAGE
         # =================================================
 
         original_caption = clean_caption(
@@ -287,46 +469,38 @@ async def auto_forward(
             message.chat.title or "Private"
         )
 
-        # =================================================
-        # NEW VIRAL CAPTION
-        # =================================================
-
         new_caption = build_caption(
             original_caption,
             source_name
         )
 
-        # =================================================
-        # COPY MESSAGE
-        # =================================================
-
-        await context.bot.copy_message(
+        ok = await safe_copy(
+            context=context,
             chat_id=DESTINATION_CHAT_ID,
             from_chat_id=message.chat_id,
             message_id=message.message_id,
-            caption=new_caption,
-            parse_mode=ParseMode.HTML
+            caption=new_caption
         )
 
-        stats["today"] += 1
-        stats["total"] += 1
+        if ok:
 
-        logger.info(
-            f"✅ Forwarded "
-            f"{message.chat.id}:{message.message_id}"
-        )
+            stats["today"] += 1
+            stats["total"] += 1
 
-        # =================================================
-        # AUTO DELETE
-        # =================================================
+            logger.info(
+                f"✅ Forwarded "
+                f"{message.chat.id}:{message.message_id}"
+            )
 
         if AUTO_DELETE:
+
             try:
                 await message.delete()
             except Exception:
                 pass
 
     except Exception as e:
+
         logger.error(f"Forward error: {e}")
 
 # =========================================================
@@ -340,13 +514,9 @@ def main():
     app = (
         ApplicationBuilder()
         .token(TOKEN)
-        .concurrent_updates(True)
+        .concurrent_updates(20)
         .build()
     )
-
-    # =====================================================
-    # COMMANDS
-    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -355,19 +525,11 @@ def main():
         )
     )
 
-    # =====================================================
-    # JOIN
-    # =====================================================
-
     app.add_handler(
         ChatJoinRequestHandler(
             approve_join
         )
     )
-
-    # =====================================================
-    # TRACK
-    # =====================================================
 
     app.add_handler(
         ChatMemberHandler(
@@ -375,10 +537,6 @@ def main():
             ChatMemberHandler.MY_CHAT_MEMBER
         )
     )
-
-    # =====================================================
-    # MEDIA HANDLER
-    # =====================================================
 
     app.add_handler(
         MessageHandler(
@@ -391,7 +549,7 @@ def main():
         )
     )
 
-    logger.info("🚀 Premium Telegram Bot Started")
+    logger.info("🚀 Telegram Bot Started")
 
     app.run_polling(
         drop_pending_updates=True,
